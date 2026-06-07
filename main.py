@@ -424,13 +424,18 @@ def main(page: ft.Page):
     def handle_search(e):
         query = search_input.value.strip()
         if not query:
-            show_snack(page, "検索キーワードを入力してください。", ft.Colors.WARNING)
+            show_snack(page, "検索キーワードを入力してください。", ft.Colors.AMBER_700)
             return
         threading.Thread(target=run_search, args=(query,), daemon=True).start()
 
     def handle_submit(e):
         alias = alias_input.value.strip()
         path = path_input.value.strip()
+        
+        if not alias or not path:
+            show_snack(page, "すべての項目を入力してください。", ft.Colors.AMBER_700)
+            return
+            
         success, message = register_app_path(alias, path)
         
         if success:
@@ -544,7 +549,7 @@ def main(page: ft.Page):
 
     def handle_selected_delete(e):
         if not checked_items:
-            show_snack(page, "選択された項目がありません。", ft.Colors.WARNING)
+            show_snack(page, "選択された項目がありません。", ft.Colors.AMBER_700)
             return
             
         success_count = 0
@@ -558,14 +563,14 @@ def main(page: ft.Page):
                 errors.append(f"{alias}: {msg}")
                 
         if errors:
-            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.AMBER_700)
         else:
             show_snack(page, f"選択したショートカット（{success_count}件）を削除しました。", ft.Colors.GREEN_700)
         refresh_shortcuts_ui()
 
     def handle_selected_restore(e):
         if not checked_items:
-            show_snack(page, "選択された項目がありません。", ft.Colors.WARNING)
+            show_snack(page, "選択された項目がありません。", ft.Colors.AMBER_700)
             return
             
         all_shortcuts = get_all_shortcuts_from_db()
@@ -585,7 +590,7 @@ def main(page: ft.Page):
                 errors.append(f"{alias}: {msg}")
                 
         if errors:
-            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.AMBER_700)
         else:
             show_snack(page, f"選択したショートカット（{success_count}件）を復元しました！", ft.Colors.GREEN_700)
         refresh_shortcuts_ui()
@@ -593,7 +598,7 @@ def main(page: ft.Page):
     def handle_bulk_delete(e):
         active_list = get_active_shortcuts()
         if not active_list:
-            show_snack(page, "削除対象の登録済みショートカットがありません。", ft.Colors.WARNING)
+            show_snack(page, "削除対象の登録済みショートカットがありません。", ft.Colors.AMBER_700)
             return
             
         success_count = 0
@@ -608,7 +613,7 @@ def main(page: ft.Page):
         mark_all_active_deleted()
         
         if errors:
-            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.AMBER_700)
         else:
             show_snack(page, f"すべてのショートカット（{success_count}件）を一括削除しました。元に戻すことができます。", ft.Colors.GREEN_700)
         refresh_shortcuts_ui()
@@ -616,7 +621,7 @@ def main(page: ft.Page):
     def handle_bulk_restore(e):
         deleted_list = get_deleted_shortcuts()
         if not deleted_list:
-            show_snack(page, "復元対象の削除済みショートカットがありません。", ft.Colors.WARNING)
+            show_snack(page, "復元対象の削除済みショートカットがありません。", ft.Colors.AMBER_700)
             return
             
         success_count = 0
@@ -631,7 +636,7 @@ def main(page: ft.Page):
         mark_all_deleted_active()
         
         if errors:
-            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.AMBER_700)
         else:
             show_snack(page, f"すべてのショートカット（{success_count}件）を復元しました！", ft.Colors.GREEN_700)
         refresh_shortcuts_ui()
