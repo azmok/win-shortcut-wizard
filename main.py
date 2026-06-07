@@ -1,10 +1,133 @@
 import os
 import re
+import json
+import sqlite3
 import asyncio
 import winreg
 import subprocess
 import threading
 import flet as ft
+
+DB_FILE = "shortcut_wizard.db"
+
+def init_db():
+    """データベースのテーブルを初期化する"""
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_cache (
+                query TEXT PRIMARY KEY,
+                results TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS shortcuts (
+                alias TEXT PRIMARY KEY,
+                exe_path TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_deleted INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+
+def get_search_cache(query: str) -> list[str] | None:
+    """キャッシュから検索結果を取得する"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT results FROM search_cache WHERE query = ?", (query.lower(),))
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+    except Exception as e:
+        print(f"Cache Read Error: {e}")
+    return None
+
+def set_search_cache(query: str, results: list[str]):
+    """検索結果をキャッシュに保存する"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO search_cache (query, results) VALUES (?, ?)",
+                (query.lower(), json.dumps(results))
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Cache Write Error: {e}")
+
+def save_shortcut_to_db(alias: str, exe_path: str):
+    """ショートカット情報をデータベースに保存（登録状態）"""
+    if not alias.lower().endswith(".exe"):
+        alias += ".exe"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO shortcuts (alias, exe_path, is_deleted) VALUES (?, ?, 0)",
+                (alias, exe_path)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"DB Write Error: {e}")
+
+def mark_shortcut_deleted(alias: str):
+    """ショートカット情報を削除状態としてマーク"""
+    if not alias.lower().endswith(".exe"):
+        alias += ".exe"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE shortcuts SET is_deleted = 1 WHERE alias = ?",
+                (alias,)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"DB Update Error: {e}")
+
+def get_active_shortcuts() -> list[tuple[str, str]]:
+    """登録中の（削除されていない）ショートカット一覧を取得"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT alias, exe_path FROM shortcuts WHERE is_deleted = 0")
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"DB Read Error: {e}")
+        return []
+
+def get_deleted_shortcuts() -> list[tuple[str, str]]:
+    """一括削除などで論理削除されたショートカット一覧を取得"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT alias, exe_path FROM shortcuts WHERE is_deleted = 1")
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"DB Read Error: {e}")
+        return []
+
+def mark_all_active_deleted():
+    """すべての登録中のショートカットを論理削除状態にする"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE shortcuts SET is_deleted = 1 WHERE is_deleted = 0")
+            conn.commit()
+    except Exception as e:
+        print(f"DB Update Error: {e}")
+
+def mark_all_deleted_active():
+    """すべての論理削除されたショートカットをアクティブ状態にする"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE shortcuts SET is_deleted = 0 WHERE is_deleted = 1")
+            conn.commit()
+    except Exception as e:
+        print(f"DB Update Error: {e}")
 
 def register_app_path(alias: str, exe_path: str) -> tuple[bool, str]:
     """WindowsのHKCUレジストリにショートカット名を登録する（管理者権限不要）"""
@@ -20,6 +143,24 @@ def register_app_path(alias: str, exe_path: str) -> tuple[bool, str]:
             winreg.SetValueEx(key, "", 0, winreg.REG_SZ, exe_path)
             app_dir = os.path.dirname(exe_path)
             winreg.SetValueEx(key, "Path", 0, winreg.REG_SZ, app_dir)
+        return True, alias
+    except Exception as e:
+        return False, str(e)
+
+def unregister_app_path(alias: str) -> tuple[bool, str]:
+    """WindowsのHKCUレジストリからショートカット名を削除する"""
+    if not alias:
+        return False, "エイリアス名が指定されていません。"
+    
+    if not alias.lower().endswith(".exe"):
+        alias += ".exe"
+        
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS) as key:
+            winreg.DeleteKey(key, alias)
+        return True, alias
+    except FileNotFoundError:
         return True, alias
     except Exception as e:
         return False, str(e)
@@ -205,7 +346,13 @@ def main(page: ft.Page):
         candidates_list.controls.append(ft.Text("検索中...", italic=True, color=ft.Colors.SECONDARY))
         page.update()
 
-        results = search_apps_via_powershell(query)
+        # キャッシュの確認
+        cached = get_search_cache(query)
+        if cached is not None:
+            results = cached
+        else:
+            results = search_apps_via_powershell(query)
+            set_search_cache(query, results)
 
         candidates_list.controls.clear()
         if not results:
@@ -213,9 +360,10 @@ def main(page: ft.Page):
                 ft.Text("候補が見つかりませんでした。別の名前でお試しください。", color=ft.Colors.RED_400)
             )
         else:
+            source_info = " (キャッシュ)" if cached is not None else ""
             candidates_list.controls.append(
                 ft.Text(
-                    f"検索結果 ({len(results)}件): クリックして選択",
+                    f"検索結果 ({len(results)}件){source_info}: クリックして選択",
                     size=12,
                     color=ft.Colors.BLUE_ACCENT,
                     weight=ft.FontWeight.BOLD,
@@ -245,9 +393,12 @@ def main(page: ft.Page):
         threading.Thread(target=run_search, args=(query,), daemon=True).start()
 
     def handle_submit(e):
-        success, message = register_app_path(alias_input.value.strip(), path_input.value.strip())
+        alias = alias_input.value.strip()
+        path = path_input.value.strip()
+        success, message = register_app_path(alias, path)
         
         if success:
+            save_shortcut_to_db(message, path)
             show_snack(
                 page,
                 f"成功！「Win + R」→「{message}」で起動できます。（再起動は不要です）",
@@ -259,6 +410,52 @@ def main(page: ft.Page):
             candidates_container.visible = False
         else:
             show_snack(page, f"エラー: {message}", ft.Colors.RED_700)
+        page.update()
+
+    def handle_bulk_delete(e):
+        active_list = get_active_shortcuts()
+        if not active_list:
+            show_snack(page, "削除対象の登録済みショートカットがありません。", ft.Colors.WARNING)
+            return
+            
+        success_count = 0
+        errors = []
+        for alias, exe_path in active_list:
+            success, msg = unregister_app_path(alias)
+            if success:
+                success_count += 1
+            else:
+                errors.append(f"{alias}: {msg}")
+        
+        mark_all_active_deleted()
+        
+        if errors:
+            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+        else:
+            show_snack(page, f"すべてのショートカット（{success_count}件）を一括削除しました。元に戻すことができます。", ft.Colors.GREEN_700)
+        page.update()
+
+    def handle_bulk_restore(e):
+        deleted_list = get_deleted_shortcuts()
+        if not deleted_list:
+            show_snack(page, "復元対象の削除済みショートカットがありません。", ft.Colors.WARNING)
+            return
+            
+        success_count = 0
+        errors = []
+        for alias, exe_path in deleted_list:
+            success, msg = register_app_path(alias, exe_path)
+            if success:
+                success_count += 1
+            else:
+                errors.append(f"{alias}: {msg}")
+        
+        mark_all_deleted_active()
+        
+        if errors:
+            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+        else:
+            show_snack(page, f"すべてのショートカット（{success_count}件）を復元しました！", ft.Colors.GREEN_700)
         page.update()
 
     search_button = ft.IconButton(
@@ -310,6 +507,32 @@ def main(page: ft.Page):
                     width=float("inf"),
                     on_click=handle_submit,
                 ),
+                
+                ft.Row(
+                    controls=[
+                        ft.Button(
+                            content=ft.Text("一括削除 (論理削除)", color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.RED_700,
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            expand=True,
+                            height=40,
+                            on_click=handle_bulk_delete,
+                        ),
+                        ft.Button(
+                            content=ft.Text("一括復元 (元に戻す)", color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.GREEN_700,
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            expand=True,
+                            height=40,
+                            on_click=handle_bulk_restore,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
             ],
             spacing=15,
             horizontal_alignment=ft.CrossAxisAlignment.START,
@@ -317,4 +540,5 @@ def main(page: ft.Page):
     )
 
 if __name__ == "__main__":
+    init_db()
     ft.run(main)
