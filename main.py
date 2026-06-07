@@ -217,6 +217,8 @@ def should_rebuild_index() -> bool:
 
 def search_apps_from_index(query: str) -> list[str]:
     """SQLiteインデックスから大文字小文字を無視してアプリを部分一致検索する"""
+    import time
+    t_start = time.time()
     safe_query = re.sub(r'[^a-zA-Z0-9\s_\-\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', query).strip()
     if not safe_query:
         return []
@@ -224,14 +226,20 @@ def search_apps_from_index(query: str) -> list[str]:
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            t_q_start = time.time()
             cursor.execute(
                 "SELECT path FROM apps_index WHERE filename LIKE ? ORDER BY filename ASC",
                 (f"%{safe_query}%",)
             )
-            return [row[0] for row in cursor.fetchall()]
+            res = [row[0] for row in cursor.fetchall()]
+            t_q_end = time.time()
+            print(f"[DEBUG] SQL execution for '{safe_query}' took {t_q_end - t_q_start:.6f} seconds.")
+            return res
     except Exception as e:
         print(f"Search Apps From Index Error: {e}")
         return []
+    finally:
+        print(f"[DEBUG] search_apps_from_index total time: {time.time() - t_start:.6f} seconds.")
 
 def get_search_cache(query: str) -> list[str] | None:
     """キャッシュから検索結果を取得する"""
@@ -720,10 +728,19 @@ def main(page: ft.Page):
             return
 
         # インデックスDBから部分一致で取得
+        import time
+        t_start = time.time()
         results = search_apps_from_index(clean_query)
+        t_elapsed = time.time() - t_start
+        print(f"[DEBUG] search_apps_from_index('{clean_query}') took {t_elapsed:.6f} seconds. Results count: {len(results)}")
 
+        t_ui_start = time.time()
         candidates_list.controls.clear()
-        if not results:
+        
+        # UI レンダリングのオーバーヘッドを避けるため、表示件数を最大50件に制限する
+        display_results = results[:50]
+        
+        if not display_results:
             candidates_list.controls.append(
                 ft.Container(
                     content=ft.Column(
@@ -752,15 +769,16 @@ def main(page: ft.Page):
                 )
             )
         else:
+            limit_msg = f" (上位50件を表示)" if len(results) > 50 else ""
             candidates_list.controls.append(
                 ft.Text(
-                    f"検索結果 ({len(results)}件): クリックして選択",
+                    f"検索結果 ({len(results)}件){limit_msg}: クリックして選択",
                     size=12,
                     color=ft.Colors.BLUE_ACCENT,
                     weight=ft.FontWeight.BOLD,
                 )
             )
-            for path in results:
+            for path in display_results:
                 filename = os.path.basename(path)
                 candidates_list.controls.append(
                     ft.ListTile(
@@ -774,7 +792,10 @@ def main(page: ft.Page):
 
         search_progress.visible = False
         search_button.disabled = False
+        t_ui_pop_end = time.time()
         page.update()
+        t_ui_update_end = time.time()
+        print(f"[DEBUG] UI population took {t_ui_pop_end - t_ui_start:.6f} seconds. page.update() took {t_ui_update_end - t_ui_pop_end:.6f} seconds. Total UI time: {t_ui_update_end - t_ui_start:.6f} seconds.")
 
     def handle_search(e):
         query = search_input.value.strip()
