@@ -12,6 +12,12 @@ from main import (
     mark_all_deleted_active,
     register_app_path,
     unregister_app_path,
+    add_custom_path_to_db,
+    delete_custom_path_from_db,
+    get_custom_paths_from_db,
+    search_apps_from_index,
+    build_apps_index_in_background,
+    should_rebuild_index,
     DB_FILE
 )
 
@@ -38,6 +44,130 @@ def run_tests():
     cached_upper = get_search_cache(test_query.upper())
     assert cached_upper == test_results, "Cache key normalization failed"
     print("[PASS] search_cache read/write & normalization")
+
+    # キャッシュとカスタムディレクトリの連動テスト
+    clean_query = "notepad"
+    custom_dirs_1 = []
+    custom_dirs_2 = ["C:\\CustomDir"]
+    
+    cache_key_1 = f"{clean_query}:{','.join(sorted(custom_dirs_1))}"
+    cache_key_2 = f"{clean_query}:{','.join(sorted(custom_dirs_2))}"
+    
+    results_1 = ["C:\\Windows\\notepad.exe"]
+    results_2 = ["C:\\Windows\\notepad.exe", "C:\\CustomDir\\notepad.exe"]
+    
+    set_search_cache(cache_key_1, results_1)
+    set_search_cache(cache_key_2, results_2)
+    
+    assert get_search_cache(cache_key_1) == results_1, "Cache key 1 mismatch"
+    assert get_search_cache(cache_key_2) == results_2, "Cache key 2 mismatch"
+    
+    # クリーンアップ
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM search_cache WHERE query IN (?, ?)", (cache_key_1.lower(), cache_key_2.lower()))
+        conn.commit()
+    print("[PASS] cache key separation by custom directories")
+
+    # 2.5 カスタムパスのテスト
+    print("Testing custom paths...")
+    test_custom_path_1 = "C:\\__test_custom_path_1__"
+    test_custom_path_2 = "C:\\__test_custom_path_2__"
+    
+    delete_custom_path_from_db(test_custom_path_1)
+    delete_custom_path_from_db(test_custom_path_2)
+    
+    # 追加
+    add_custom_path_to_db(test_custom_path_1)
+    add_custom_path_to_db(test_custom_path_2)
+    
+    # 取得と検証
+    customs = get_custom_paths_from_db()
+    assert test_custom_path_1 in customs, "test_custom_path_1 was not added"
+    assert test_custom_path_2 in customs, "test_custom_path_2 was not added"
+    
+    # 削除と検証
+    delete_custom_path_from_db(test_custom_path_1)
+    customs_after = get_custom_paths_from_db()
+    assert test_custom_path_1 not in customs_after, "test_custom_path_1 was not deleted"
+    assert test_custom_path_2 in customs_after, "test_custom_path_2 should still exist"
+    
+    # クリーンアップ
+    delete_custom_path_from_db(test_custom_path_2)
+    customs_final = get_custom_paths_from_db()
+    assert test_custom_path_2 not in customs_final, "test_custom_path_2 cleanup failed"
+    print("[PASS] custom_paths add/delete/get")
+
+    # 2.8 アプリインデックスのテスト
+    print("Testing apps_index (search indexer)...")
+    test_exe_path_1 = "C:\\Windows\\System32\\__test_notepad__.exe"
+    test_exe_path_2 = "C:\\Program Files\\__test_chrome__.exe"
+    test_exe_path_3 = "C:\\Custom\\__test_cursor__.exe"
+    
+    # ダミーデータをインデックスDBへ直接挿入
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM apps_index WHERE path IN (?, ?, ?)", (test_exe_path_1, test_exe_path_2, test_exe_path_3))
+        cursor.execute("INSERT OR REPLACE INTO apps_index (path, filename) VALUES (?, ?)", (test_exe_path_1, "__test_notepad__.exe"))
+        cursor.execute("INSERT OR REPLACE INTO apps_index (path, filename) VALUES (?, ?)", (test_exe_path_2, "__test_chrome__.exe"))
+        cursor.execute("INSERT OR REPLACE INTO apps_index (path, filename) VALUES (?, ?)", (test_exe_path_3, "__test_cursor__.exe"))
+        conn.commit()
+        
+    # 部分一致での検索テスト
+    results_note = search_apps_from_index("note")
+    assert test_exe_path_1 in results_note, f"Expected {test_exe_path_1} in search results for 'note'"
+    
+    # 大文字小文字を無視した検索テスト
+    results_chrome = search_apps_from_index("CHROME")
+    assert test_exe_path_2 in results_chrome, f"Expected {test_exe_path_2} in search results for 'CHROME'"
+    
+    # 複数キーワードや無関係なクエリでの除外テスト
+    results_none = search_apps_from_index("nonexistent_app")
+    assert len(results_none) == 0, "Expected empty results for nonexistent query"
+    
+    # 2.8.1 should_rebuild_index の検証
+    # 一度全て削除して空の状態にする
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM apps_index WHERE path IN (?, ?, ?)", (test_exe_path_1, test_exe_path_2, test_exe_path_3))
+        # 既存のデータも一旦退避するか、テスト用に空にする。
+        # ここでは退避せずに全削除し、後で復元するのは大変なので、テスト専用に temporary に確認する。
+        # ただし、すでに本物のデータがある可能性があるので、一度本物のデータを取得して退避する。
+        cursor.execute("SELECT path, filename, last_scanned FROM apps_index")
+        backup_data = cursor.fetchall()
+        cursor.execute("DELETE FROM apps_index")
+        conn.commit()
+
+    try:
+        # 空の状態の検証
+        assert should_rebuild_index() is True, "Expected True when apps_index is empty"
+
+        # 新しいレコード（現在時刻）を追加して検証
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO apps_index (path, filename, last_scanned) VALUES (?, ?, datetime('now'))", (test_exe_path_1, "__test_notepad__.exe"))
+            conn.commit()
+        assert should_rebuild_index() is False, "Expected False when index is fresh (less than 12h)"
+
+        # 13時間前のレコードに更新して検証
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE apps_index SET last_scanned = datetime('now', '-13 hours') WHERE path = ?", (test_exe_path_1,))
+            conn.commit()
+        assert should_rebuild_index() is True, "Expected True when index is old (more than 12h)"
+    finally:
+        # テストデータのクリーンアップと退避データの復元
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM apps_index")
+            if backup_data:
+                cursor.executemany(
+                    "INSERT INTO apps_index (path, filename, last_scanned) VALUES (?, ?, ?)",
+                    backup_data
+                )
+            conn.commit()
+
+    print("[PASS] apps_index search & lookup (including should_rebuild_index)")
 
     # 3. ショートカットのテスト
     test_alias_1 = "__test_shortcut_1.exe"

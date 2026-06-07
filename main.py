@@ -10,6 +10,10 @@ import flet as ft
 
 DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcut_wizard.db")
 
+# インデクサーの排他制御用
+is_indexing = False
+indexer_lock = threading.Lock()
+
 def init_db():
     """データベースのテーブルを初期化する"""
     with sqlite3.connect(DB_FILE) as conn:
@@ -29,7 +33,205 @@ def init_db():
                 is_deleted INTEGER DEFAULT 0
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS custom_paths (
+                path TEXT PRIMARY KEY
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS apps_index (
+                path TEXT PRIMARY KEY,
+                filename TEXT,
+                last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
+
+def add_custom_path_to_db(path: str):
+    """カスタムパスをデータベースに追加"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO custom_paths (path) VALUES (?)", (path,))
+            conn.commit()
+    except Exception as e:
+        print(f"DB Write Error (custom_paths): {e}")
+
+def delete_custom_path_from_db(path: str):
+    """カスタムパスをデータベースから削除"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM custom_paths WHERE path = ?", (path,))
+            conn.commit()
+    except Exception as e:
+        print(f"DB Delete Error (custom_paths): {e}")
+
+def get_custom_paths_from_db() -> list[str]:
+    """データベースからすべてのカスタムパスを取得"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT path FROM custom_paths")
+            return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"DB Read Error (custom_paths): {e}")
+        return []
+
+def build_apps_index_in_background(custom_dirs: list[str], on_complete_callback=None):
+    """バックグラウンドで指定フォルダ以下の.exeファイルをスキャンし、インデックスDBを構築する"""
+    global is_indexing
+    
+    with indexer_lock:
+        if is_indexing:
+            print("Indexer is already running. Skipping this build request.")
+            if on_complete_callback:
+                on_complete_callback(False)
+            return
+        is_indexing = True
+
+    default_dirs = [
+        "$env:ProgramFiles",
+        "${env:ProgramFiles(x86)}",
+        "$env:LOCALAPPDATA\\Programs",
+        "$env:LOCALAPPDATA"
+    ]
+    
+    all_dirs_ps = []
+    for d in default_dirs:
+        all_dirs_ps.append(f'"{d}"')
+    for d in custom_dirs:
+        escaped_d = d.replace("'", "''")
+        all_dirs_ps.append(f'"{escaped_d}"')
+        
+    dirs_array_string = ", ".join(all_dirs_ps)
+
+    ps_script = f"""
+    $sh = New-Object -ComObject WScript.Shell
+    $results = @()
+
+    $shortcutPaths = @(
+        "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs",
+        "$env:USERPROFILE\\Desktop",
+        "C:\\Users\\Public\\Desktop"
+    ) | Where-Object {{ $_ -and (Test-Path $_) }}
+
+    $lnks = Get-ChildItem -Path $shortcutPaths -Filter "*.lnk" -Recurse -ErrorAction SilentlyContinue
+
+    foreach ($lnk in $lnks) {{
+        try {{
+            $target = $sh.CreateShortcut($lnk.FullName).TargetPath
+            if ($target -and $target.EndsWith(".exe") -and (Test-Path $target)) {{
+                $results += $target
+            }}
+        }} catch {{}}
+    }}
+
+    $dirs = @({dirs_array_string}) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
+
+    foreach ($dir in $dirs) {{
+        $depth = if ($dir -eq "$env:LOCALAPPDATA") {{ 2 }} else {{ 3 }}
+        Get-ChildItem -Path $dir -Filter "*.exe" -Depth $depth -File -ErrorAction SilentlyContinue |
+            ForEach-Object {{ $results += $_.FullName }}
+    }}
+
+    $results | Select-Object -Unique
+    """
+
+    success = False
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        
+        paths = []
+        for line in result.stdout.splitlines():
+            line = line.strip().strip('"').strip("'")
+            if line and line.lower().endswith(".exe"):
+                paths.append(line)
+        
+        seen = set()
+        unique_paths = []
+        for p in paths:
+            p_lower = p.lower()
+            if p_lower not in seen:
+                seen.add(p_lower)
+                unique_paths.append(p)
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            cursor.execute("DELETE FROM apps_index")
+            cursor.executemany(
+                "INSERT OR REPLACE INTO apps_index (path, filename, last_scanned) VALUES (?, ?, datetime('now'))",
+                [(p, os.path.basename(p)) for p in unique_paths]
+            )
+            conn.commit()
+            
+        print(f"Apps Index Built: {len(unique_paths)} apps indexed.")
+        success = True
+    except Exception as e:
+        print(f"Build Apps Index Error: {e}")
+        success = False
+    finally:
+        with indexer_lock:
+            is_indexing = False
+        
+    if on_complete_callback:
+        on_complete_callback(success)
+
+def should_rebuild_index() -> bool:
+    """インデックスを再構築すべきかどうかを判定する（前回の更新から12時間以上経過しているか、またはインデックスが空の場合）"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM apps_index")
+            count = cursor.fetchone()[0]
+            if count == 0:
+                return True
+            
+            cursor.execute("SELECT MAX(last_scanned) FROM apps_index")
+            max_scanned = cursor.fetchone()[0]
+            if not max_scanned:
+                return True
+            
+            from datetime import datetime, timezone
+            try:
+                # datetime('now') は UTC なので timezone.utc を使用してパース
+                dt = datetime.strptime(max_scanned, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                elapsed = (now - dt).total_seconds()
+                # 12時間 = 43200秒
+                return elapsed > 43200
+            except ValueError:
+                return True
+    except Exception as e:
+        print(f"Error checking index status: {e}")
+        return True
+
+def search_apps_from_index(query: str) -> list[str]:
+    """SQLiteインデックスから大文字小文字を無視してアプリを部分一致検索する"""
+    safe_query = re.sub(r'[^a-zA-Z0-9\s_\-\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', query).strip()
+    if not safe_query:
+        return []
+        
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT path FROM apps_index WHERE filename LIKE ? ORDER BY filename ASC",
+                (f"%{safe_query}%",)
+            )
+            return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Search Apps From Index Error: {e}")
+        return []
 
 def get_search_cache(query: str) -> list[str] | None:
     """キャッシュから検索結果を取得する"""
@@ -214,13 +416,52 @@ def open_file_dialog_via_powershell() -> str:
     )
     return result.stdout.strip()
 
-def search_apps_via_powershell(query: str) -> list[str]:
+def open_folder_dialog_via_powershell() -> str:
+    """PowerShell の FolderBrowserDialog を使ってネイティブフォルダ選択ダイアログを開く"""
+    ps_script = r"""
+    Add-Type -AssemblyName System.Windows.Forms
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = '検索対象のフォルダを選択してください'
+    if ($dialog.ShowDialog() -eq 'OK') {
+        $dialog.SelectedPath
+    } else {
+        ''
+    }
+    """
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+    )
+    return result.stdout.strip()
+
+def search_apps_via_powershell(query: str, custom_dirs: list[str]) -> list[str]:
     """PowerShellを使用して、指定されたディレクトリからexeファイルを検索する"""
     safe_query = re.sub(r'[^a-zA-Z0-9\s_\-\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', query).strip()
     if not safe_query:
         return []
 
     escaped_query = safe_query.replace("'", "''")
+
+    # デフォルトのディレクトリ
+    default_dirs = [
+        "$env:ProgramFiles",
+        "${env:ProgramFiles(x86)}",
+        "$env:LOCALAPPDATA\\Programs",
+        "$env:LOCALAPPDATA"
+    ]
+    
+    # カスタムディレクトリを追加
+    all_dirs_ps = []
+    for d in default_dirs:
+        all_dirs_ps.append(f'"{d}"')
+    for d in custom_dirs:
+        escaped_d = d.replace("'", "''")
+        all_dirs_ps.append(f'"{escaped_d}"')
+        
+    dirs_array_string = ", ".join(all_dirs_ps)
 
     ps_script = f"""
     $sh = New-Object -ComObject WScript.Shell
@@ -247,12 +488,7 @@ def search_apps_via_powershell(query: str) -> list[str]:
     }}
 
     # 2. 一般的なインストールディレクトリを浅い階層で直接検索 (Depth 3)
-    $dirs = @(
-        "$env:ProgramFiles",
-        "${{env:ProgramFiles(x86)}}",
-        "$env:LOCALAPPDATA\\Programs",
-        "$env:LOCALAPPDATA"
-    ) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
+    $dirs = @({dirs_array_string}) | Where-Object {{ $_ -and (Test-Path $_) }} | Select-Object -Unique
 
     foreach ($dir in $dirs) {{
         $depth = if ($dir -eq "$env:LOCALAPPDATA") {{ 2 }} else {{ 3 }}
@@ -303,12 +539,14 @@ def show_snack(page: ft.Page, message: str, bgcolor: str):
 def main(page: ft.Page):
     page.title = "Win + R Shortcut Wizard"
     page.window_width = 540
-    page.window_height = 800
+    page.window_height = 900
     page.window_resizable = False
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 25
     page.scroll = ft.ScrollMode.AUTO
     
+    index_status = ft.Text("検索インデックス更新中...", size=10, color=ft.Colors.AMBER_400, visible=False)
+
     alias_input = ft.TextField(
         label="希望するショートカット名",
         hint_text="例: craft, todo, cursor",
@@ -352,6 +590,106 @@ def main(page: ft.Page):
         visible=False,
     )
 
+    # 検索対象パスの表示用Column
+    paths_list_column = ft.Column(spacing=2)
+    paths_list_container = ft.Container(
+        content=paths_list_column,
+        border=ft.Border.all(1, "surfacevariant"),
+        border_radius=8,
+        padding=10,
+    )
+    
+    def get_env_expanded_defaults() -> list[str]:
+        paths = []
+        pf = os.environ.get("ProgramFiles")
+        if pf: paths.append(pf)
+        pf86 = os.environ.get("ProgramFiles(x86)")
+        if pf86: paths.append(pf86)
+        local_app = os.environ.get("LOCALAPPDATA")
+        if local_app:
+            paths.append(os.path.join(local_app, "Programs"))
+            paths.append(local_app)
+        return paths
+
+    def refresh_paths_list_ui():
+        paths_list_column.controls.clear()
+        
+        # デフォルトパスの表示
+        defaults = get_env_expanded_defaults()
+        for p in defaults:
+            paths_list_column.controls.append(
+                ft.Row(
+                    controls=[
+                        ft.Icon(ft.Icons.FOLDER_OPEN, size=12, color=ft.Colors.SECONDARY),
+                        ft.Text(p, size=10, color=ft.Colors.SECONDARY, expand=True),
+                        ft.Text("(デフォルト)", size=9, color=ft.Colors.WHITE_30),
+                    ],
+                    spacing=5,
+                )
+            )
+            
+        # カスタムパスの表示
+        customs = get_custom_paths_from_db()
+        for p in customs:
+            def make_delete_path(path_to_del):
+                return lambda _: handle_delete_custom_path(path_to_del)
+                
+            paths_list_column.controls.append(
+                ft.Row(
+                    controls=[
+                        ft.Icon(ft.Icons.FOLDER, size=12, color=ft.Colors.BLUE_ACCENT),
+                        ft.Text(p, size=10, color=ft.Colors.BLUE_ACCENT, expand=True),
+                        ft.IconButton(
+                            icon=ft.Icons.CLOSE_ROUNDED,
+                            icon_size=10,
+                            visual_density=ft.VisualDensity.COMPACT,
+                            tooltip="この検索対象を削除",
+                            on_click=make_delete_path(p),
+                        ),
+                    ],
+                    spacing=5,
+                )
+            )
+        page.update()
+
+    def trigger_index_build(force=False):
+        global is_indexing
+        if is_indexing:
+            # 既にバックグラウンドで動いている場合は新たな構築を走らせない
+            return
+
+        if not force and not should_rebuild_index():
+            print("Apps index is up-to-date. Skipping build.")
+            return
+
+        index_status.visible = True
+        page.update()
+        
+        def on_complete(success):
+            index_status.visible = False
+            if success:
+                show_snack(page, "検索インデックスを更新しました。", ft.Colors.GREEN_700)
+            else:
+                show_snack(page, "検索インデックスの更新に失敗しました。", ft.Colors.RED_700)
+            page.update()
+            
+        custom_dirs = get_custom_paths_from_db()
+        threading.Thread(target=build_apps_index_in_background, args=(custom_dirs, on_complete), daemon=True).start()
+
+    def handle_delete_custom_path(path):
+        delete_custom_path_from_db(path)
+        show_snack(page, f"検索対象から「{os.path.basename(path)}」を削除しました。", ft.Colors.GREEN_700)
+        refresh_paths_list_ui()
+        trigger_index_build(force=True)
+
+    async def handle_add_custom_path(e):
+        path = await asyncio.to_thread(open_folder_dialog_via_powershell)
+        if path:
+            add_custom_path_to_db(path)
+            show_snack(page, f"検索対象に「{path}」を追加しました。", ft.Colors.GREEN_700)
+            refresh_paths_list_ui()
+            trigger_index_build(force=True)
+
     # ファイル選択ボタン（PowerShell の WinForms ダイアログを使用）
     async def pick_file_clicked(e):
         # 別スレッドでブロッキングな PowerShell ダイアログを開く
@@ -372,7 +710,6 @@ def main(page: ft.Page):
         candidates_list.controls.append(ft.Text("検索中...", italic=True, color=ft.Colors.SECONDARY))
         page.update()
 
-        # クエリを事前にクリーン化して、キャッシュのキーと検索処理で一貫して使用する
         clean_query = re.sub(r'[^a-zA-Z0-9\s_\-\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', query).strip()
         if not clean_query:
             search_progress.visible = False
@@ -382,24 +719,42 @@ def main(page: ft.Page):
             page.update()
             return
 
-        # キャッシュの確認
-        cached = get_search_cache(clean_query)
-        if cached is not None:
-            results = cached
-        else:
-            results = search_apps_via_powershell(clean_query)
-            set_search_cache(clean_query, results)
+        # インデックスDBから部分一致で取得
+        results = search_apps_from_index(clean_query)
 
         candidates_list.controls.clear()
         if not results:
             candidates_list.controls.append(
-                ft.Text("候補が見つかりませんでした。別の名前でお試しください。", color=ft.Colors.RED_400)
+                ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            ft.Row(
+                                controls=[
+                                    ft.Icon(ft.Icons.INFO_OUTLINED, color=ft.Colors.RED_400, size=20),
+                                    ft.Text(
+                                        f"「{clean_query}」が見つかりません",
+                                        color=ft.Colors.RED_400,
+                                        size=14,
+                                        weight=ft.FontWeight.BOLD,
+                                    ),
+                                ],
+                                spacing=5,
+                            ),
+                            ft.Text(
+                                "PC内に対象の.exeファイルが見つかりませんでした。\n正確なアプリ名を入力するか、上の「フォルダ追加」ボタンから検索対象のディレクトリを追加してください。",
+                                size=11,
+                                color=ft.Colors.SECONDARY,
+                            ),
+                        ],
+                        spacing=8,
+                    ),
+                    padding=5,
+                )
             )
         else:
-            source_info = " (キャッシュ)" if cached is not None else ""
             candidates_list.controls.append(
                 ft.Text(
-                    f"検索結果 ({len(results)}件){source_info}: クリックして選択",
+                    f"検索結果 ({len(results)}件): クリックして選択",
                     size=12,
                     color=ft.Colors.BLUE_ACCENT,
                     weight=ft.FontWeight.BOLD,
@@ -671,7 +1026,38 @@ def main(page: ft.Page):
                 
                 ft.Divider(height=20, color="surfacevariant"),
                 
-                ft.Text("アプリの検索 (自動入力)", size=14, weight=ft.FontWeight.BOLD),
+                ft.Row(
+                    controls=[
+                        ft.Row(
+                            controls=[
+                                ft.Text("アプリの検索 (自動入力)", size=14, weight=ft.FontWeight.BOLD),
+                                index_status,
+                            ],
+                            spacing=10,
+                        ),
+                        ft.Row(
+                            controls=[
+                                ft.IconButton(
+                                    icon=ft.Icons.REFRESH_ROUNDED,
+                                    icon_size=16,
+                                    icon_color=ft.Colors.BLUE_ACCENT,
+                                    tooltip="検索インデックスを再構築",
+                                    on_click=lambda _: trigger_index_build(force=True),
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.CREATE_NEW_FOLDER_ROUNDED,
+                                    icon_size=16,
+                                    icon_color=ft.Colors.BLUE_ACCENT,
+                                    tooltip="検索対象のフォルダを追加",
+                                    on_click=handle_add_custom_path,
+                                ),
+                            ],
+                            spacing=5,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                paths_list_container,
                 ft.Row(
                     controls=[search_input, search_progress, search_button],
                 ),
@@ -752,7 +1138,13 @@ def main(page: ft.Page):
 
     # 初回UI更新
     refresh_shortcuts_ui()
+    refresh_paths_list_ui()
+    trigger_index_build(force=False)
 
 if __name__ == "__main__":
     init_db()
-    ft.run(main)
+    import sys
+    if "--web" in sys.argv:
+        ft.app(target=main, view=None, port=8551)
+    else:
+        ft.run(main)
