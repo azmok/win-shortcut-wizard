@@ -68,6 +68,26 @@ def run_tests():
     aliases = [item[0] for item in active_shortcuts]
     assert test_alias_1 in aliases, "test_alias_1 not found in active shortcuts"
     assert test_alias_2 in aliases, "test_alias_2 not found in active shortcuts"
+    
+    # get_all_shortcuts_from_db のテスト
+    from main import get_all_shortcuts_from_db, mark_shortcut_active, mark_shortcut_deleted
+    all_shortcuts = get_all_shortcuts_from_db()
+    all_aliases = [item[0] for item in all_shortcuts]
+    assert test_alias_1 in all_aliases, "test_alias_1 not found in all shortcuts list"
+    assert test_alias_2 in all_aliases, "test_alias_2 not found in all shortcuts list"
+    print("[PASS] get_all_shortcuts_from_db")
+
+    # 個別論理削除と復元のテスト
+    mark_shortcut_deleted(test_alias_1)
+    all_shortcuts = get_all_shortcuts_from_db()
+    status_map = {item[0]: item[2] for item in all_shortcuts}
+    assert status_map[test_alias_1] == 1, "test_alias_1 was not logically deleted"
+    
+    mark_shortcut_active(test_alias_1)
+    all_shortcuts = get_all_shortcuts_from_db()
+    status_map = {item[0]: item[2] for item in all_shortcuts}
+    assert status_map[test_alias_1] == 0, "test_alias_1 was not logically activated"
+    print("[PASS] individual logical delete & activate")
     print("[PASS] shortcut registration (Registry + DB)")
 
     # レジストリにキーが存在するか確認

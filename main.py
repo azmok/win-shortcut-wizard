@@ -8,7 +8,7 @@ import subprocess
 import threading
 import flet as ft
 
-DB_FILE = "shortcut_wizard.db"
+DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcut_wizard.db")
 
 def init_db():
     """データベースのテーブルを初期化する"""
@@ -87,6 +87,21 @@ def mark_shortcut_deleted(alias: str):
     except Exception as e:
         print(f"DB Update Error: {e}")
 
+def mark_shortcut_active(alias: str):
+    """ショートカット情報をアクティブ（有効）としてマーク"""
+    if not alias.lower().endswith(".exe"):
+        alias += ".exe"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE shortcuts SET is_deleted = 0 WHERE alias = ?",
+                (alias,)
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"DB Update Error: {e}")
+
 def get_active_shortcuts() -> list[tuple[str, str]]:
     """登録中の（削除されていない）ショートカット一覧を取得"""
     try:
@@ -104,6 +119,17 @@ def get_deleted_shortcuts() -> list[tuple[str, str]]:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT alias, exe_path FROM shortcuts WHERE is_deleted = 1")
+            return cursor.fetchall()
+    except Exception as e:
+        print(f"DB Read Error: {e}")
+        return []
+
+def get_all_shortcuts_from_db() -> list[tuple[str, str, int]]:
+    """データベースからすべてのショートカット（アクティブ＆論理削除済み）を取得"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT alias, exe_path, is_deleted FROM shortcuts ORDER BY registered_at DESC")
             return cursor.fetchall()
     except Exception as e:
         print(f"DB Read Error: {e}")
@@ -277,7 +303,7 @@ def show_snack(page: ft.Page, message: str, bgcolor: str):
 def main(page: ft.Page):
     page.title = "Win + R Shortcut Wizard"
     page.window_width = 540
-    page.window_height = 680
+    page.window_height = 800
     page.window_resizable = False
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 25
@@ -346,13 +372,23 @@ def main(page: ft.Page):
         candidates_list.controls.append(ft.Text("検索中...", italic=True, color=ft.Colors.SECONDARY))
         page.update()
 
+        # クエリを事前にクリーン化して、キャッシュのキーと検索処理で一貫して使用する
+        clean_query = re.sub(r'[^a-zA-Z0-9\s_\-\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', query).strip()
+        if not clean_query:
+            search_progress.visible = False
+            search_button.disabled = False
+            candidates_list.controls.clear()
+            candidates_list.controls.append(ft.Text("有効な検索キーワードを入力してください。", color=ft.Colors.RED_400))
+            page.update()
+            return
+
         # キャッシュの確認
-        cached = get_search_cache(query)
+        cached = get_search_cache(clean_query)
         if cached is not None:
             results = cached
         else:
-            results = search_apps_via_powershell(query)
-            set_search_cache(query, results)
+            results = search_apps_via_powershell(clean_query)
+            set_search_cache(clean_query, results)
 
         candidates_list.controls.clear()
         if not results:
@@ -408,9 +444,151 @@ def main(page: ft.Page):
             path_input.value = ""
             search_input.value = ""
             candidates_container.visible = False
+            refresh_shortcuts_ui()
         else:
             show_snack(page, f"エラー: {message}", ft.Colors.RED_700)
         page.update()
+
+    # チェックされたアイテムを保持するセット
+    checked_items = set()
+
+    # 登録済みショートカットを表示するためのリストビュー
+    shortcuts_list = ft.ListView(expand=True, spacing=5, height=180)
+    shortcuts_container = ft.Container(
+        content=shortcuts_list,
+        border=ft.Border.all(1, "surfacevariant"),
+        border_radius=8,
+        padding=10,
+    )
+
+    def refresh_shortcuts_ui():
+        shortcuts_list.controls.clear()
+        checked_items.clear()
+        
+        all_shortcuts = get_all_shortcuts_from_db()
+        if not all_shortcuts:
+            shortcuts_list.controls.append(
+                ft.Text("登録されたショートカットはありません。", color=ft.Colors.SECONDARY, italic=True)
+            )
+            page.update()
+            return
+            
+        for alias, exe_path, is_deleted in all_shortcuts:
+            status_text = "有効" if is_deleted == 0 else "削除済"
+            status_color = ft.Colors.GREEN_400 if is_deleted == 0 else ft.Colors.RED_400
+            
+            # 各項目のチェックボックス選択時のアクション
+            def make_on_change(a):
+                return lambda e: checked_items.add(a) if e.control.value else checked_items.discard(a)
+
+            cb = ft.Checkbox(
+                value=False,
+                on_change=make_on_change(alias),
+            )
+            
+            # 個別のアクションボタン（削除または復元）
+            if is_deleted == 0:
+                action_btn = ft.IconButton(
+                    icon=ft.Icons.DELETE_ROUNDED,
+                    icon_color=ft.Colors.RED_400,
+                    tooltip="このショートカットを削除",
+                    on_click=lambda _, a=alias: handle_single_delete(a),
+                )
+                text_style = ft.TextStyle()
+            else:
+                action_btn = ft.IconButton(
+                    icon=ft.Icons.RESTORE_ROUNDED,
+                    icon_color=ft.Colors.GREEN_400,
+                    tooltip="このショートカットを復元",
+                    on_click=lambda _, a=alias, p=exe_path: handle_single_restore(a, p),
+                )
+                text_style = ft.TextStyle(decoration=ft.TextDecoration.LINE_THROUGH, color=ft.Colors.SECONDARY)
+            
+            shortcuts_list.controls.append(
+                ft.Row(
+                    controls=[
+                        cb,
+                        ft.Column(
+                            controls=[
+                                ft.Text(alias, size=14, weight=ft.FontWeight.W_600, style=text_style),
+                                ft.Text(exe_path, size=11, color=ft.Colors.SECONDARY),
+                            ],
+                            expand=True,
+                            spacing=2,
+                        ),
+                        ft.Text(status_text, size=11, color=status_color),
+                        action_btn,
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                )
+            )
+        page.update()
+
+    def handle_single_delete(alias):
+        success, msg = unregister_app_path(alias)
+        if success:
+            mark_shortcut_deleted(alias)
+            show_snack(page, f"ショートカット「{alias}」を削除しました。", ft.Colors.GREEN_700)
+        else:
+            show_snack(page, f"削除エラー: {msg}", ft.Colors.RED_700)
+        refresh_shortcuts_ui()
+
+    def handle_single_restore(alias, exe_path):
+        success, msg = register_app_path(alias, exe_path)
+        if success:
+            mark_shortcut_active(alias)
+            show_snack(page, f"ショートカット「{alias}」を復元しました！", ft.Colors.GREEN_700)
+        else:
+            show_snack(page, f"復元エラー: {msg}", ft.Colors.RED_700)
+        refresh_shortcuts_ui()
+
+    def handle_selected_delete(e):
+        if not checked_items:
+            show_snack(page, "選択された項目がありません。", ft.Colors.WARNING)
+            return
+            
+        success_count = 0
+        errors = []
+        for alias in list(checked_items):
+            success, msg = unregister_app_path(alias)
+            if success:
+                mark_shortcut_deleted(alias)
+                success_count += 1
+            else:
+                errors.append(f"{alias}: {msg}")
+                
+        if errors:
+            show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+        else:
+            show_snack(page, f"選択したショートカット（{success_count}件）を削除しました。", ft.Colors.GREEN_700)
+        refresh_shortcuts_ui()
+
+    def handle_selected_restore(e):
+        if not checked_items:
+            show_snack(page, "選択された項目がありません。", ft.Colors.WARNING)
+            return
+            
+        all_shortcuts = get_all_shortcuts_from_db()
+        path_map = {alias: exe_path for alias, exe_path, _ in all_shortcuts}
+        
+        success_count = 0
+        errors = []
+        for alias in list(checked_items):
+            exe_path = path_map.get(alias)
+            if not exe_path:
+                continue
+            success, msg = register_app_path(alias, exe_path)
+            if success:
+                mark_shortcut_active(alias)
+                success_count += 1
+            else:
+                errors.append(f"{alias}: {msg}")
+                
+        if errors:
+            show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
+        else:
+            show_snack(page, f"選択したショートカット（{success_count}件）を復元しました！", ft.Colors.GREEN_700)
+        refresh_shortcuts_ui()
 
     def handle_bulk_delete(e):
         active_list = get_active_shortcuts()
@@ -433,7 +611,7 @@ def main(page: ft.Page):
             show_snack(page, f"{success_count}件を削除しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
         else:
             show_snack(page, f"すべてのショートカット（{success_count}件）を一括削除しました。元に戻すことができます。", ft.Colors.GREEN_700)
-        page.update()
+        refresh_shortcuts_ui()
 
     def handle_bulk_restore(e):
         deleted_list = get_deleted_shortcuts()
@@ -456,7 +634,7 @@ def main(page: ft.Page):
             show_snack(page, f"{success_count}件を復元しましたが、一部でエラーが発生しました。\n" + "\n".join(errors), ft.Colors.WARNING)
         else:
             show_snack(page, f"すべてのショートカット（{success_count}件）を復元しました！", ft.Colors.GREEN_700)
-        page.update()
+        refresh_shortcuts_ui()
 
     search_button = ft.IconButton(
         icon=ft.Icons.SEARCH,
@@ -508,36 +686,67 @@ def main(page: ft.Page):
                     on_click=handle_submit,
                 ),
                 
+                ft.Divider(height=20, color="surfacevariant"),
+                
+                ft.Text("登録済みショートカット一覧", size=14, weight=ft.FontWeight.BOLD),
+                shortcuts_container,
+                
                 ft.Row(
                     controls=[
                         ft.Button(
-                            content=ft.Text("一括削除 (論理削除)", color=ft.Colors.WHITE),
-                            bgcolor=ft.Colors.RED_700,
+                            content=ft.Text("選択削除", color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.RED_ACCENT_400,
                             style=ft.ButtonStyle(
                                 shape=ft.RoundedRectangleBorder(radius=8),
                             ),
                             expand=True,
-                            height=40,
+                            height=35,
+                            on_click=handle_selected_delete,
+                        ),
+                        ft.Button(
+                            content=ft.Text("選択復元", color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.GREEN_ACCENT_400,
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            expand=True,
+                            height=35,
+                            on_click=handle_selected_restore,
+                        ),
+                    ]
+                ),
+                ft.Row(
+                    controls=[
+                        ft.Button(
+                            content=ft.Text("一括削除", color=ft.Colors.RED_400),
+                            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                            style=ft.ButtonStyle(
+                                shape=ft.RoundedRectangleBorder(radius=8),
+                            ),
+                            expand=True,
+                            height=35,
                             on_click=handle_bulk_delete,
                         ),
                         ft.Button(
-                            content=ft.Text("一括復元 (元に戻す)", color=ft.Colors.WHITE),
-                            bgcolor=ft.Colors.GREEN_700,
+                            content=ft.Text("一括復元", color=ft.Colors.GREEN_400),
+                            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
                             style=ft.ButtonStyle(
                                 shape=ft.RoundedRectangleBorder(radius=8),
                             ),
                             expand=True,
-                            height=40,
+                            height=35,
                             on_click=handle_bulk_restore,
                         ),
-                    ],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ]
                 ),
             ],
             spacing=15,
             horizontal_alignment=ft.CrossAxisAlignment.START,
         )
     )
+
+    # 初回UI更新
+    refresh_shortcuts_ui()
 
 if __name__ == "__main__":
     init_db()
