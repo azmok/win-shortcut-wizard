@@ -34,6 +34,141 @@ def set_windows_app_identity():
     except Exception:
         pass
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class _PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", _GUID), ("pid", wintypes.DWORD)]
+
+    class _PROPVARIANT(ctypes.Structure):
+        # x64で24バイト, x86で16バイトになるようにパディングを確保
+        _fields_ = [
+            ("vt", wintypes.USHORT),
+            ("wReserved1", wintypes.USHORT),
+            ("wReserved2", wintypes.USHORT),
+            ("wReserved3", wintypes.USHORT),
+            ("data", ctypes.c_void_p * 2),
+        ]
+
+def _make_guid(guid_str):
+    """文字列形式のGUIDをctypes構造体に変換する"""
+    import uuid
+    u = uuid.UUID(guid_str)
+    return _GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+def _set_window_relaunch_identity(hwnd):
+    """
+    タスクバーにピン留めしたときに、Fletのホストプロセス(flet.exe)ではなく
+    本体のShortcutWizard.exeを起動させるため、ウィンドウのプロパティストアに
+    AppUserModelIDとRelaunchコマンドを設定する。
+    """
+    import sys
+
+    # Frozen(PyInstaller)時のみ意味を持つ。本体exeの絶対パスを使う。
+    exe_path = os.path.abspath(sys.executable)
+
+    PROPERTYKEY = _PROPERTYKEY
+    PROPVARIANT = _PROPVARIANT
+
+    fmtid = _make_guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}")
+    PKEY_AppUserModel_ID = PROPERTYKEY(fmtid, 5)
+    PKEY_AppUserModel_RelaunchCommand = PROPERTYKEY(fmtid, 2)
+    PKEY_AppUserModel_RelaunchIconResource = PROPERTYKEY(fmtid, 3)
+    PKEY_AppUserModel_RelaunchDisplayNameResource = PROPERTYKEY(fmtid, 4)
+
+    IID_IPropertyStore = ctypes.byref(_make_guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}"))
+
+    ole32 = ctypes.windll.ole32
+    shell32 = ctypes.windll.shell32
+    ole32.CoTaskMemAlloc.restype = ctypes.c_void_p
+    ole32.CoTaskMemAlloc.argtypes = [ctypes.c_size_t]
+
+    VT_LPWSTR = 31
+
+    ole32.CoInitialize(None)
+    try:
+        store = ctypes.c_void_p()
+        hr = shell32.SHGetPropertyStoreForWindow(
+            wintypes.HWND(hwnd), IID_IPropertyStore, ctypes.byref(store)
+        )
+        if hr != 0 or not store.value:
+            return
+
+        # IPropertyStore vtable: 6=SetValue, 7=Commit, 2=Release
+        vtbl = ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))
+        funcs = ctypes.cast(vtbl[0], ctypes.POINTER(ctypes.c_void_p))
+        SetValue = ctypes.WINFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p,
+            ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT),
+        )(funcs[6])
+        Commit = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(funcs[7])
+        Release = ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p)(funcs[2])
+
+        def set_str(pkey, value):
+            # propsysのInitPropVariantFromStringは環境により未エクスポートのため、
+            # VT_LPWSTRのPROPVARIANTを手動構築する（CoTaskMemAllocで確保し、
+            # PropVariantClearがCoTaskMemFreeで解放する）。
+            pv = PROPVARIANT()
+            nbytes = (len(value) + 1) * ctypes.sizeof(ctypes.c_wchar)
+            mem = ole32.CoTaskMemAlloc(nbytes)
+            if not mem:
+                return
+            ctypes.memmove(mem, ctypes.c_wchar_p(value), nbytes)
+            pv.vt = VT_LPWSTR
+            pv.data[0] = mem
+            try:
+                SetValue(store, ctypes.byref(pkey), ctypes.byref(pv))
+            finally:
+                ole32.PropVariantClear(ctypes.byref(pv))
+
+        set_str(PKEY_AppUserModel_ID, APP_USER_MODEL_ID)
+        set_str(PKEY_AppUserModel_RelaunchCommand, f'"{exe_path}"')
+        set_str(PKEY_AppUserModel_RelaunchDisplayNameResource, APP_TITLE)
+        set_str(PKEY_AppUserModel_RelaunchIconResource, f"{exe_path},0")
+
+        Commit(store)
+        Release(store)
+    finally:
+        ole32.CoUninitialize()
+
+def apply_taskbar_identity_when_ready():
+    """
+    Fletのウィンドウが生成されるのを待ち、見つかったらピン留め用の
+    Relaunch情報をそのウィンドウに設定する（別スレッドで実行する想定）。
+    """
+    if os.name != "nt":
+        return
+    import sys
+    import time
+    if not getattr(sys, "frozen", False):
+        # 配布exe(凍結)以外ではsys.executableがpython.exeを指すため何もしない
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            hwnd = user32.FindWindowW(None, APP_TITLE)
+            if hwnd:
+                _set_window_relaunch_identity(hwnd)
+                return
+            time.sleep(0.3)
+    except Exception:
+        pass
+
 def signal_existing_instance():
     if os.name != "nt":
         return False
@@ -688,6 +823,7 @@ def main(page: ft.Page):
     page.window.icon = resource_path("assets", "icon.ico")
     page.window.prevent_close = False
     start_focus_event_listener(page)
+    threading.Thread(target=apply_taskbar_identity_when_ready, daemon=True).start()
     
     index_status = ft.Text("検索インデックス更新中...", size=10, color=ft.Colors.AMBER_400, visible=False)
 
