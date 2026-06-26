@@ -8,7 +8,140 @@ import subprocess
 import threading
 import flet as ft
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcut_wizard.db")
+APP_TITLE = "Win + R Shortcut Wizard"
+APP_USER_MODEL_ID = "Azuma.WinShortcutWizard"
+MUTEX_NAME = "Local\\WinRShortcutWizard_SingleInstanceMutex"
+FOCUS_EVENT_NAME = "Local\\WinRShortcutWizard_FocusEvent"
+ERROR_ALREADY_EXISTS = 183
+WAIT_OBJECT_0 = 0
+INFINITE = 0xFFFFFFFF
+_focus_event_handle = None
+
+def resource_path(*parts):
+    import sys
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, *parts)
+
+def set_windows_app_identity():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+        shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:
+        pass
+
+def signal_existing_instance():
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.OpenEventW.restype = wintypes.HANDLE
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        event = kernel32.OpenEventW(0x0002, False, FOCUS_EVENT_NAME)
+        if event:
+            kernel32.SetEvent(event)
+            kernel32.CloseHandle(event)
+            return True
+    except Exception:
+        pass
+    return bring_window_to_front_by_title()
+
+def bring_window_to_front_by_title():
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        hwnd = user32.FindWindowW(None, APP_TITLE)
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    return False
+
+def start_focus_event_listener(page: ft.Page):
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        global _focus_event_handle
+        _focus_event_handle = kernel32.CreateEventW(None, False, False, FOCUS_EVENT_NAME)
+        if not _focus_event_handle:
+            return
+
+        async def focus_window():
+            page.window.visible = True
+            page.window.minimized = False
+            page.window.focused = True
+            page.update()
+            try:
+                await page.window.to_front()
+            except Exception:
+                bring_window_to_front_by_title()
+
+        def wait_for_focus_requests():
+            while True:
+                if kernel32.WaitForSingleObject(_focus_event_handle, INFINITE) == WAIT_OBJECT_0:
+                    page.run_task(focus_window)
+
+        threading.Thread(target=wait_for_focus_requests, daemon=True).start()
+    except Exception:
+        pass
+
+def get_db_path():
+    db_dir = os.path.join(os.path.expanduser("~"), ".shortcut_wizard")
+    os.makedirs(db_dir, exist_ok=True)
+    new_db = os.path.join(db_dir, "shortcut_wizard.db")
+
+    # Migrate data from older database locations if new one does not exist
+    if not os.path.exists(new_db):
+        import sys
+        import shutil
+        candidates = []
+        try:
+            candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "shortcut_wizard.db"))
+        except Exception:
+            pass
+        if getattr(sys, 'frozen', False):
+            try:
+                candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "shortcut_wizard.db"))
+            except Exception:
+                pass
+
+        for cand in candidates:
+            if os.path.abspath(cand) == os.path.abspath(new_db):
+                continue
+            if os.path.exists(cand):
+                try:
+                    shutil.copy2(cand, new_db)
+                    print(f"Migrated database from {cand} to {new_db}")
+                    break
+                except Exception as e:
+                    print(f"Failed to migrate database: {e}")
+
+    return new_db
+
+DB_FILE = get_db_path()
 
 # インデクサーの排他制御用
 is_indexing = False
@@ -545,13 +678,16 @@ def show_snack(page: ft.Page, message: str, bgcolor: str):
     ))
 
 def main(page: ft.Page):
-    page.title = "Win + R Shortcut Wizard"
+    page.title = APP_TITLE
     page.window_width = 540
     page.window_height = 900
     page.window_resizable = False
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 25
     page.scroll = ft.ScrollMode.AUTO
+    page.window.icon = resource_path("assets", "icon.ico")
+    page.window.prevent_close = False
+    start_focus_event_listener(page)
     
     index_status = ft.Text("検索インデックス更新中...", size=10, color=ft.Colors.AMBER_400, visible=False)
 
@@ -1163,9 +1299,23 @@ def main(page: ft.Page):
     trigger_index_build(force=False)
 
 if __name__ == "__main__":
-    init_db()
     import sys
+    set_windows_app_identity()
+
+    # Enforce single instance on Windows (desktop mode only)
+    if os.name == "nt" and "--web" not in sys.argv:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        mutex = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            signal_existing_instance()
+            sys.exit(0)
+
+    init_db()
     if "--web" in sys.argv:
-        ft.app(target=main, view=None, port=8551)
+        ft.app(target=main, view=None, port=8551, assets_dir="assets")
     else:
-        ft.run(main)
+        ft.app(target=main, assets_dir="assets")
